@@ -18,11 +18,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
-COPY . .
+# Hugging Face Spaces run as a non-root user (uid 1000)
+RUN useradd -m -u 1000 user
+USER user
 
-# Expose port
-EXPOSE 8000
+# Set environment variables for cache directories so models can download successfully
+ENV HF_HOME=/home/user/.cache/huggingface \
+    SENTENCE_TRANSFORMERS_HOME=/home/user/.cache/huggingface
 
-# Start command
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Set PATH for the local user bins if needed
+ENV PATH="/home/user/.local/bin:$PATH"
+
+# Copy application code with proper ownership
+COPY --chown=user:user . .
+
+# Expose the Hugging Face port
+EXPOSE 7860
+
+# Start command (Hugging Face passes PORT dynamically, but defaults to 7860)
+CMD uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-7860}
