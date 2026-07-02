@@ -1,12 +1,16 @@
 services:
   - type: web
     name: shl-recommender
-    runtime: docker
-    plan: free
+    env: python
+    plan: standard # 2GB RAM to support the BAAI/bge-reranker-base model
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
     envVars:
-      - key: GOOGLE_API_KEY
+      - key: PYTHON_VERSION
+        value: 3.12.0
+      - key: ENABLE_RERANKER
+        value: "true"
+      - key: ENABLE_QUERY_EXPANSION
+        value: "true"
+      - key: OPENAI_API_KEY
         sync: false
-      - key: PORT
-        value: 8000
-    healthCheckPath: /health
-    autoDeploy: true

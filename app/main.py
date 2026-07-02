@@ -65,6 +65,11 @@ app.add_middleware(
 )
 
 
+@app.get("/")
+async def root():
+    """Root endpoint for basic connectivity checks."""
+    return {"status": "ok", "service": "SHL Assessment Recommender API"}
+
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
     """
