@@ -24,8 +24,9 @@ env/
 Thumbs.db
 
 # Data artifacts that can be regenerated
-# (keeping catalog.json and embeddings.npy in repo for cold-start speed)
+# (keeping catalog.json in repo for cold-start speed)
 data/catalog_raw.json
+data/embeddings.npy
 
 # Logs and Results
 *.log

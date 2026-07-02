@@ -32,6 +32,9 @@ ENV PATH="/home/user/.local/bin:$PATH"
 # Copy application code with proper ownership
 COPY --chown=user:user . .
 
+# Build embeddings and preload models during Docker build
+RUN python scripts/build_embeddings.py
+
 # Expose the Hugging Face port
 EXPOSE 7860
 
