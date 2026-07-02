@@ -1,0 +1,17 @@
+{
+    "env": {
+        "ANTHROPIC_BASE_URL": "https://openrouter.ai/api",
+        "ANTHROPIC_AUTH_TOKEN": "1a4dffbde060441a87f59a200edd654d.MpUeuV1L0ZpApvjp",
+        "ANTHROPIC_MODEL": "z-ai/glm-5.2",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": "z-ai/glm-5.2",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": "z-ai/glm-5.2",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": "z-ai/glm-5.2",
+        "ANTHROPIC_SMALL_FAST_MODEL": "z-ai/glm-5.2",
+        "CLAUDE_CODE_SUBAGENT_MODEL": "z-ai/glm-5.2"
+    },
+    "settings": {
+        "default_model": "z-ai/glm-5.2",
+        "default_subagent_model": "z-ai/glm-5.2",
+        "default_fast_model": "z-ai/glm-5.2"
+    }
+}

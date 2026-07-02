@@ -1,0 +1,28 @@
+# .gitignore
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Environment
+.env
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data artifacts that can be regenerated
+# (keeping catalog.json and embeddings.npy in repo for cold-start speed)
+data/catalog_raw.json
