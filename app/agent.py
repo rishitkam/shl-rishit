@@ -295,8 +295,8 @@ async def generate_response(request: ChatRequest) -> ChatResponse:
 
     # Step 3: Search catalog — hybrid retrieval (dense + keyword + RRF)
     t_retrieval_start = time.time()
-    # Retrieve top 150 candidates using the hybrid retriever
-    hybrid_candidates = catalog_store.search(query, top_k=150, mode="rrf_stratified")
+    # Retrieve top 50 candidates using the hybrid retriever for lower latency on CPU
+    hybrid_candidates = catalog_store.search(query, top_k=50, mode="rrf_stratified")
     retrieval_latency = time.time() - t_retrieval_start
     
     t_rerank_start = time.time()
@@ -446,8 +446,12 @@ async def generate_response(request: ChatRequest) -> ChatResponse:
         # Update diagnostics log with final recommendations
         debug_info["raw_recommendation_urls"] = [r.get("url") for r in raw_recs if isinstance(r, dict)]
         debug_info["llm_latency"] = llm_latency
-        with open("diagnostics_log.jsonl", "a") as f:
-            f.write(json.dumps(debug_info) + "\n")
+        
+        try:
+            with open("/tmp/diagnostics_log.jsonl", "a") as f:
+                f.write(json.dumps(debug_info) + "\n")
+        except Exception as log_err:
+            logger.warning(f"Failed to write diagnostics log: {log_err}")
 
         return ChatResponse(
             reply=reply,
