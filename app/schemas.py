@@ -1,7 +1,7 @@
 """Pydantic models matching the exact API schema required by the grading harness."""
 
 from pydantic import BaseModel, Field
-from typing import List
+from typing import List, Optional, Dict
 
 
 class Message(BaseModel):

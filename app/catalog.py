@@ -7,7 +7,7 @@ import json
 import os
 import logging
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Tuple
 
 import numpy as np
 
@@ -82,9 +82,17 @@ class CatalogStore:
 
         # Load the embedding model for query-time embedding
         logger.info("Loading embedding model...")
-        from sentence_transformers import SentenceTransformer
+        from sentence_transformers import SentenceTransformer, CrossEncoder
         self._embed_model = SentenceTransformer("all-MiniLM-L6-v2")
         logger.info("Embedding model loaded")
+        
+        # Load the cross-encoder for reranking
+        self._enable_reranker = os.getenv("ENABLE_RERANKER", "false").lower() == "true"
+        if self._enable_reranker:
+            logger.info("Loading cross-encoder model (BAAI/bge-reranker-base)...")
+            # Using bge-reranker-base as requested for better semantic retrieval
+            self._cross_encoder = CrossEncoder("BAAI/bge-reranker-base")
+            logger.info("Cross-encoder model loaded")
 
         self._loaded = True
 
@@ -123,30 +131,28 @@ class CatalogStore:
 
         return None
 
-    def search(self, query: str, top_k: int = 20) -> List[CatalogItem]:
-        """
-        Hybrid search: dense (cosine) + sparse (keyword BM25-style) with
-        reciprocal rank fusion. This addresses the core retrieval gap where
-        dense-only search misses short-name items (SQL, Spring, Docker) and
-        cross-facet items (personality questionnaires for technical roles).
-        """
+    def search(self, query: str, top_k: int = 40, mode: str = "rrf") -> List[CatalogItem]:
+        """Search the catalog using hybrid retrieval."""
         if not self._loaded or self.embeddings is None or self._embed_model is None:
             logger.warning("Catalog not loaded, returning empty results")
             return []
 
         n = len(self.items)
+        if n == 0:
+            return []
 
-        # ── Dense ranking (cosine similarity) ──────────────────────────
+        # ── Dense ranking (semantic similarity) ────────────────────────
         query_embedding = self._embed_model.encode(query, normalize_embeddings=True)
-        similarities = np.dot(self.embeddings, query_embedding)
-        dense_ranking = np.argsort(similarities)[::-1]  # indices sorted by score desc
+        import numpy as np
+        dense_scores = np.dot(self.embeddings, query_embedding)
+
+        dense_ranking = np.argsort(dense_scores)[::-1]
         dense_rank = np.zeros(n, dtype=int)
         for rank, idx in enumerate(dense_ranking):
-            dense_rank[idx] = rank  # rank 0 = best
+            dense_rank[idx] = rank
 
         # ── Sparse ranking (keyword/token overlap) ─────────────────────
         query_lower = query.lower()
-        # Extract meaningful tokens: split on whitespace and non-alpha, keep 2+ chars
         import re as _re
         query_tokens = set(_re.findall(r'[a-z0-9]+', query_lower))
         query_tokens = {t for t in query_tokens if len(t) >= 2}
@@ -158,21 +164,14 @@ class CatalogStore:
             name_tokens = set(_re.findall(r'[a-z0-9]+', name_lower))
 
             score = 0.0
-
-            # Exact name substring match (strongest signal)
             for qt in query_tokens:
                 if len(qt) >= 3 and qt in name_lower:
-                    score += 3.0  # strong: query token appears in product name
-
-            # Token overlap with name
+                    score += 3.0
             overlap = query_tokens & name_tokens
             score += 2.0 * len(overlap)
-
-            # Token matches in description (weaker)
             for qt in query_tokens:
                 if len(qt) >= 3 and qt in desc_lower:
                     score += 0.5
-
             sparse_scores[i] = score
 
         sparse_ranking = np.argsort(sparse_scores)[::-1]
@@ -180,15 +179,99 @@ class CatalogStore:
         for rank, idx in enumerate(sparse_ranking):
             sparse_rank[idx] = rank
 
-        # ── Reciprocal Rank Fusion ─────────────────────────────────────
-        # RRF(d) = 1/(k + rank_dense(d)) + 1/(k + rank_sparse(d))
-        # k=60 is the standard constant from the RRF paper
-        k = 60
-        rrf_scores = 1.0 / (k + dense_rank) + 1.0 / (k + sparse_rank)
+        # ── Mode Selection ─────────────────────────────────────────────
+        if mode == "dense":
+            top_indices = dense_ranking[:top_k]
+            return [self.items[i] for i in top_indices]
+        
+        elif mode == "sparse":
+            top_indices = sparse_ranking[:top_k]
+            return [self.items[i] for i in top_indices]
+            
+        elif mode == "rrf":
+            k = 60
+            rrf_scores = 1.0 / (k + dense_rank) + 1.0 / (k + sparse_rank)
+            top_indices = np.argsort(rrf_scores)[::-1][:top_k]
+            return [self.items[i] for i in top_indices]
+            
+        elif mode == "rrf_stratified":
+            k = 60
+            rrf_scores = 1.0 / (k + dense_rank) + 1.0 / (k + sparse_rank)
+            sorted_indices = np.argsort(rrf_scores)[::-1]
+            
+            candidates = []
+            candidate_urls = set()
+            
+            # Main ranking
+            for i in sorted_indices[:top_k]:
+                item = self.items[i]
+                candidates.append(item)
+                candidate_urls.add(item.url)
+                
+            # Stratification: Top 2 per category
+            categories_found = {cat: 0 for cat in ['A', 'B', 'C', 'D', 'E', 'K', 'P', 'S']}
+            for item in candidates:
+                for t in item.test_type.split(","):
+                    t = t.strip()
+                    if t in categories_found:
+                        categories_found[t] += 1
+                        
+            for i in sorted_indices:
+                item = self.items[i]
+                if item.url in candidate_urls:
+                    continue
+                item_types = [t.strip() for t in item.test_type.split(",") if t.strip()]
+                added = False
+                for t in item_types:
+                    if t in categories_found and categories_found[t] < 2:
+                        if not added:
+                            candidates.append(item)
+                            candidate_urls.add(item.url)
+                            added = True
+                        categories_found[t] += 1
+                        
+            return candidates
+            
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
 
-        top_indices = np.argsort(rrf_scores)[::-1][:top_k]
-
-        return [self.items[i] for i in top_indices]
+    def rerank(self, query: str, candidates: List[CatalogItem], top_k: int = 40) -> Tuple[List[CatalogItem], List[str]]:
+        """
+        Rerank candidates using a cross-encoder.
+        Returns (reranked_candidates, debug_candidate_urls)
+        """
+        if not getattr(self, "_enable_reranker", False) or not hasattr(self, "_cross_encoder"):
+            return candidates[:top_k], [c.url for c in candidates]
+            
+        if len(candidates) <= 40:
+            logger.info("Skipping reranking, candidate pool size %d <= 40", len(candidates))
+            return candidates[:top_k], [c.url for c in candidates]
+            
+        import time
+        t0 = time.time()
+        
+        pairs = [[query, f"{c.name} {c.description}"] for c in candidates]
+        scores = self._cross_encoder.predict(pairs)
+        
+        import numpy as np
+        sorted_indices = np.argsort(scores)[::-1]
+        
+        # Log internal scores for diagnostics
+        logger.info(f"--- Reranker Diagnostics (Query: '{query[:50]}...') ---")
+        for rank, idx in enumerate(sorted_indices[:10], 1):
+            c = candidates[idx]
+            # We don't have the original dense/sparse here easily without recomputing,
+            # but we can log the cross-encoder score and final rank.
+            logger.info(f"Rank {rank} | CE Score: {scores[idx]:.4f} | {c.name}")
+        logger.info("-----------------------------------------------------")
+            
+        reranked_candidates = [candidates[i] for i in sorted_indices]
+        candidate_urls = [c.url for c in reranked_candidates]
+        
+        t1 = time.time()
+        logger.info("Reranked %d candidates in %.2fs", len(candidates), t1 - t0)
+        
+        return reranked_candidates[:top_k], candidate_urls
 
     def get_item_context(self, item: CatalogItem) -> str:
         """Format a catalog item as context for the LLM prompt."""

@@ -13,6 +13,7 @@ import json
 import os
 import logging
 import asyncio
+import time
 from typing import List, Optional
 
 import httpx
@@ -22,14 +23,13 @@ from google.genai import types
 from app.schemas import ChatRequest, ChatResponse, Recommendation, Message
 from app.catalog import catalog_store, CatalogItem
 from app.guardrails import get_guardrail_refusal
+from app.query_expansion import reconstruct_intent_async
 
 logger = logging.getLogger(__name__)
 
 _MODEL_NAMES = [
-    os.getenv("GEMINI_MODEL", "gemini-1.5-flash-latest"),
-    "gemini-1.5-flash",
-    "gemini-1.5-pro",
-    "gemini-2.0-flash-lite",
+    os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+    "gpt-4.1-nano",
 ]
 _INTERNAL_TIMEOUT = 22  # seconds — leaves headroom within the 30s external timeout
 
@@ -117,13 +117,32 @@ You MUST respond with valid JSON in this exact format:
 """
 
 
-def _build_retrieval_query(messages: List[Message]) -> str:
+async def _build_retrieval_query(messages: List[Message]) -> str:
     """
     Build a retrieval query from all user messages in the conversation.
-
-    Simple and robust: concatenate all user-turn text. This captures
-    the full context including refinements and corrections.
+    Uses the Conversation Intent Reconstructor to build a structured context.
     """
+    latest_user_message = ""
+    for msg in reversed(messages):
+        if msg.role == "user":
+            latest_user_message = msg.content
+            break
+            
+    if os.getenv("ENABLE_QUERY_EXPANSION", "false").lower() == "true":
+        msg_dicts = [{"role": m.role, "content": m.content} for m in messages]
+        intent = await reconstruct_intent_async(msg_dicts)
+        
+        if intent is not None:
+            role = intent.get("role", "")
+            objective = intent.get("objective", "")
+            constraints = "\n".join(intent.get("constraints", []))
+            action = intent.get("conversation_action", "")
+            summary = intent.get("conversation_summary", "")
+            
+            context = f"Role: {role}\nObjective: {objective}\nConstraints:\n{constraints}\nConversation Action: {action}\n\nAccumulated Intent Summary:\n{summary}\n\nLatest User Message:\n{latest_user_message}"
+            return context
+
+    # Fallback: concatenate all user texts
     user_texts = []
     for msg in messages:
         if msg.role == "user":
@@ -181,11 +200,9 @@ def _build_turn_budget_instruction(num_messages: int) -> str:
     return ""
 
 
-def _validate_recommendations(
-    raw_recs: list,
-) -> List[Recommendation]:
+def _validate_recommendations(raw_recs: List[dict]) -> List[Recommendation]:
     """
-    Validate recommendations against the catalog.
+    Check LLM recommendations against the catalog.
 
     Every (name, url) pair must exist in the catalog. Drop any that don't
     match — never trust the LLM's claim about what's in the catalog.
@@ -272,38 +289,42 @@ async def generate_response(request: ChatRequest) -> ChatResponse:
         )
 
     # Step 2: Build retrieval query
-    query = _build_retrieval_query(messages)
+    t_query_start = time.time()
+    query = await _build_retrieval_query(messages)
+    query_latency = time.time() - t_query_start
 
     # Step 3: Search catalog — hybrid retrieval (dense + keyword + RRF)
-    candidates = catalog_store.search(query, top_k=40)
-    candidate_urls = {c.url for c in candidates}
+    t_retrieval_start = time.time()
+    # Retrieve top 150 candidates using the hybrid retriever
+    hybrid_candidates = catalog_store.search(query, top_k=150, mode="rrf_stratified")
+    retrieval_latency = time.time() - t_retrieval_start
     
-    # Facet injection: personality/general-ability items are expected alongside
-    # technical assessments in most traces but share zero semantic space with
-    # technical queries. Always include these as candidates so the LLM can
-    # decide whether they're relevant to the specific role.
-    USE_HARDCODED_INJECTION = os.getenv("USE_HARDCODED_INJECTION", "true").lower() == "true"
-    if USE_HARDCODED_INJECTION:
-        _CROSS_FACET_SLUGS = [
-            "occupational-personality-questionnaire-opq32r",
-            "shl-verify-interactive-g",   # SHL Verify Interactive G+
-            "verify-g",                    # Verify - G+
-        ]
-        for item in catalog_store.items:
-            if item.url not in candidate_urls:
-                slug = item.url.rstrip("/").split("/")[-1]
-                if slug in _CROSS_FACET_SLUGS:
-                    candidates.append(item)
-                    candidate_urls.add(item.url)
+    t_rerank_start = time.time()
+    # Rerank to top 40 using cross-encoder
+    candidates, all_candidate_urls = catalog_store.rerank(query, hybrid_candidates, top_k=40)
+    rerank_latency = time.time() - t_rerank_start
     
-    # History injection: re-inject any previously mentioned catalog items to
-    # prevent them from dropping out of context on refinement turns.
-    history_text = " ".join([m.content for m in request.messages if m.role == "assistant"])
-    for item in catalog_store.items:
-        if item.url not in candidate_urls:
-            if item.name in history_text or item.url in history_text:
-                candidates.append(item)
-                candidate_urls.add(item.url)
+    hybrid_candidate_urls = []
+    seen_hybrid = set()
+    for c in hybrid_candidates:
+        if c.url not in seen_hybrid:
+            hybrid_candidate_urls.append(c.url)
+            seen_hybrid.add(c.url)
+            
+    # Dump diagnostics to local file for eval_harness.py
+    import json
+    debug_info = {
+        "hybrid_candidate_urls": hybrid_candidate_urls,
+        "all_candidate_urls": all_candidate_urls,
+        "query_latency": query_latency,
+        "retrieval_latency": retrieval_latency,
+        "rerank_latency": rerank_latency
+    }
+    # Store diagnostics in memory to be written at the end
+    
+    # Removed broken string-matching History Injection logic
+    # because the structured Conversation Intent Reconstructor
+    # naturally preserves semantic constraints for the retriever.
                 
     # Step 4: Build the LLM prompt
     candidates_context = _format_candidates_context(candidates)
@@ -312,86 +333,77 @@ async def generate_response(request: ChatRequest) -> ChatResponse:
     # Build conversation messages for the LLM
     llm_messages = []
 
-    # System-level context (prepended to the first user message or as system instruction)
+    # System-level context
     system_content = SYSTEM_PROMPT + "\n\n" + candidates_context + turn_budget
+    llm_messages.append({"role": "system", "content": system_content})
 
     # Add conversation history
     for msg in messages:
-        llm_messages.append(
-            types.Content(
-                role="user" if msg.role == "user" else "model",
-                parts=[types.Part.from_text(text=msg.content)],
-            )
-        )
+        llm_messages.append({
+            "role": "user" if msg.role == "user" else "assistant",
+            "content": msg.content
+        })
 
     # Step 5: Call the LLM (with model fallback chain)
     try:
-        api_key = os.getenv("GOOGLE_API_KEY")
+        api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
-            logger.error("GOOGLE_API_KEY not set")
+            logger.error("OPENAI_API_KEY not set")
             return _safe_fallback_response("missing API key")
 
-        client = genai.Client(api_key=api_key)
-
-        config = types.GenerateContentConfig(
-            system_instruction=system_content,
-            response_mime_type="application/json",
-            response_schema={
-                "type": "OBJECT",
-                "properties": {
-                    "reply": {"type": "STRING"},
-                    "recommendations": {
-                        "type": "ARRAY",
-                        "items": {
-                            "type": "OBJECT",
-                            "properties": {
-                                "name": {"type": "STRING"},
-                                "url": {"type": "STRING"},
-                                "test_type": {"type": "STRING"},
-                            },
-                            "required": ["name", "url", "test_type"],
-                        },
-                    },
-                    "end_of_conversation": {"type": "BOOLEAN"},
-                },
-                "required": ["reply", "recommendations", "end_of_conversation"],
-            },
-            temperature=0.3,
-            max_output_tokens=4096,
-        )
+        import openai
+        client = openai.AsyncOpenAI(api_key=api_key)
 
         response = None
         last_error = None
+        t_llm_start = time.time()
         for model_name in _MODEL_NAMES:
-            try:
-                logger.info("Trying model: %s", model_name)
-                response = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        client.models.generate_content,
-                        model=model_name,
-                        contents=llm_messages,
-                        config=config,
-                    ),
-                    timeout=_INTERNAL_TIMEOUT,
-                )
-                logger.info("Model %s succeeded", model_name)
-                break  # Success — exit the fallback loop
-            except Exception as model_error:
-                last_error = model_error
-                error_str = str(model_error)
-                logger.warning("Model %s failed: %s, trying next", model_name, error_str)
-                continue
+            success = False
+            for attempt in range(3):
+                try:
+                    logger.info("Trying model: %s (attempt %d)", model_name, attempt + 1)
+                    chat_completion = await asyncio.wait_for(
+                        client.chat.completions.create(
+                            messages=llm_messages,
+                            model=model_name,
+                            temperature=0.3,
+                            max_tokens=4096,
+                            response_format={"type": "json_object"}
+                        ),
+                        timeout=_INTERNAL_TIMEOUT,
+                    )
+                    logger.info("Model %s succeeded", model_name)
+                    response = chat_completion.choices[0].message.content
+                    success = True
+                    break
+                except asyncio.TimeoutError as e:
+                    last_error = e
+                    logger.warning("Model %s timed out, skipping to next", model_name)
+                    break
+                except Exception as model_error:
+                    last_error = model_error
+                    error_str = str(model_error)
+                    if "429" in error_str or "rate limit" in error_str.lower():
+                        delay = 2.0 * (2 ** attempt)
+                        logger.warning("Model %s hit 429 quota. Retrying in %.1fs...", model_name, delay)
+                        await asyncio.sleep(delay)
+                    else:
+                        logger.warning("Model %s failed: %s, trying next", model_name, error_str)
+                        break
+            if success:
+                break
 
         if response is None:
             logger.error("All models exhausted: %s", last_error)
             return _safe_fallback_response("all models quota exhausted")
 
         # Parse the response
-        raw_text = response.text
+        raw_text = response
         if not raw_text:
             logger.warning("Empty LLM response")
             return _safe_fallback_response("empty LLM response")
-
+            
+        llm_latency = time.time() - t_llm_start
         parsed = json.loads(raw_text)
 
     except asyncio.TimeoutError:
@@ -419,6 +431,7 @@ async def generate_response(request: ChatRequest) -> ChatResponse:
             end_of_conv = bool(end_of_conv)
 
         # Validate recommendations against catalog
+        raw_recommendation_urls = [r.get("url") for r in raw_recs if isinstance(r, dict)]
         validated_recs = _validate_recommendations(raw_recs)
 
         # If we had recommendations but all were dropped (hallucinated),
@@ -429,6 +442,12 @@ async def generate_response(request: ChatRequest) -> ChatResponse:
             )
             # Keep the reply but note the issue — the reply might still be useful
             # for context. The empty recommendations array is correct.
+
+        # Update diagnostics log with final recommendations
+        debug_info["raw_recommendation_urls"] = [r.get("url") for r in raw_recs if isinstance(r, dict)]
+        debug_info["llm_latency"] = llm_latency
+        with open("diagnostics_log.jsonl", "a") as f:
+            f.write(json.dumps(debug_info) + "\n")
 
         return ChatResponse(
             reply=reply,
