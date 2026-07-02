@@ -32,6 +32,13 @@ def main():
 
     texts = [build_text(r) for r in catalog]
 
+    print("Pre-downloading CrossEncoder (cross-encoder/ms-marco-MiniLM-L-6-v2) for cache...")
+    try:
+        from sentence_transformers import CrossEncoder
+        _ = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+    except Exception as e:
+        print(f"Skipping pre-download: {e}")
+
     print(f"Loading model '{MODEL_NAME}'...")
     model = SentenceTransformer(MODEL_NAME)
 

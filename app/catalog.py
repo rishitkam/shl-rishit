@@ -89,9 +89,9 @@ class CatalogStore:
         # Load the cross-encoder for reranking
         self._enable_reranker = os.getenv("ENABLE_RERANKER", "false").lower() == "true"
         if self._enable_reranker:
-            logger.info("Loading cross-encoder model (BAAI/bge-reranker-base)...")
-            # Using bge-reranker-base as requested for better semantic retrieval
-            self._cross_encoder = CrossEncoder("BAAI/bge-reranker-base")
+            logger.info("Loading cross-encoder model (cross-encoder/ms-marco-MiniLM-L-6-v2)...")
+            # Using ms-marco-MiniLM-L-6-v2 for lower CPU latency
+            self._cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
             logger.info("Cross-encoder model loaded")
 
         self._loaded = True
