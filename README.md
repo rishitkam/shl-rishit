@@ -1,3 +1,11 @@
+---
+title: SHL Recommender
+emoji: 🚀
+colorFrom: blue
+colorTo: red
+sdk: docker
+pinned: false
+---
 # SHL Conversational Assessment Recommender
 
 A conversational AI agent that helps recruiters select the right SHL assessments through dialogue. It takes vague hiring intents and refines them into grounded shortlists of 1–10 SHL assessment products.
