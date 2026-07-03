@@ -2,7 +2,7 @@ services:
   - type: web
     name: shl-recommender
     env: python
-    plan: standard # 2GB RAM to support the BAAI/bge-reranker-base model
+    plan: free # Can now use free tier due to lightweight ms-marco-MiniLM-L-6-v2 model
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
     envVars:
